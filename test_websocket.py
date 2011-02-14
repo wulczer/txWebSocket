@@ -500,3 +500,14 @@ class WebSocketHandlerTestCase(TestCase):
         """
         self.request.connectionLost(Failure(CONNECTION_DONE))
         self.handler.lostReason.trap(ConnectionDone)
+
+    def test_loseConnection_and_connectionLost(self):
+        """
+        L{Request.connectionLost} called after
+        L{WebSocketTransport.loseConnection} does not cause problems.
+        """
+        self.handler.transport.loseConnection()
+        # loseConnection() on the transport will disconnect the request, and it
+        # will get its connectionLost method fired
+        self.request.connectionLost(Failure(CONNECTION_DONE))
+        self.assertTrue(self.channel.transport.disconnected)
