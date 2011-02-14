@@ -367,9 +367,6 @@ class WebSocketTransport(object):
         Close the connection.
         """
         self._request.transport.loseConnection()
-        del self._request.transport
-        del self._request
-        del self._handler
 
 class WebSocketHandler(object):
     """
