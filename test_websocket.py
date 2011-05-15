@@ -11,6 +11,7 @@ from twisted.python.failure import Failure
 
 from websocket import WebSocketHandler, WebSocketFrameDecoder
 from websocket import WebSocketSite, WebSocketTransport
+from websocket import DecodingError
 
 from twisted.web.resource import Resource
 from twisted.web.server import Request, Site
@@ -372,6 +373,17 @@ class WebSocketFrameDecoderTestCase(TestCase):
         transport._attachHandler(handler)
         self.decoder = WebSocketFrameDecoder(request, handler)
         self.decoder.MAX_LENGTH = 100
+        self.decoder.MAX_BINARY_LENGTH = 1000
+
+
+    def assertOneDecodingError(self):
+        """
+        Assert that exactly one L{DecodingError} has been logged and return
+        that error.
+        """
+        errors = self.flushLoggedErrors(DecodingError)
+        self.assertEquals(len(errors), 1)
+        return errors[0]
 
 
     def test_oneFrame(self):
@@ -406,6 +418,7 @@ class WebSocketFrameDecoderTestCase(TestCase):
         dropped.
         """
         self.decoder.dataReceived("frame\xff")
+        self.assertOneDecodingError()
         self.assertTrue(self.channel.transport.disconnected)
 
 
@@ -415,6 +428,7 @@ class WebSocketFrameDecoderTestCase(TestCase):
         frame, the connection is dropped.
         """
         self.decoder.dataReceived("\x00frame\xfffoo")
+        self.assertOneDecodingError()
         self.assertTrue(self.channel.transport.disconnected)
         self.assertEquals(self.decoder.handler.frames, ["frame"])
 
@@ -455,6 +469,97 @@ class WebSocketFrameDecoderTestCase(TestCase):
             self.decoder.dataReceived("\x00" + "x" * 10 + "\xff")
         self.assertFalse(self.channel.transport.disconnected)
 
+
+    def test_oneBinaryFrame(self):
+        """
+        A binary frame is parsed and ignored, the following text frame is
+        delivered.
+        """
+        self.decoder.dataReceived("\xff\x0abinarydata\x00text frame\xff")
+        self.assertEquals(self.decoder.handler.frames, ["text frame"])
+
+
+    def test_multipleBinaryFrames(self):
+        """
+        Text frames intermingled with binary frames are parsed correctly.
+        """
+        tf1, tf2, tf3 = "\x00frame1\xff", "\x00frame2\xff", "\x00frame3\xff"
+        bf1, bf2, bf3 = "\xff\x01X", "\xff\x1a" + "X" * 0x1a, "\xff\x02AB"
+
+        self.decoder.dataReceived(tf1 + bf1 + bf2 + tf2 + tf3 + bf3)
+        self.assertEquals(self.decoder.handler.frames,
+                          ["frame1", "frame2", "frame3"])
+
+
+    def test_binaryFrameMultipleLengthBytes(self):
+        """
+        A binary frame can have its length field spread across multiple bytes.
+        """
+        bf = "\xff\x81\x48" + "X" * 200
+        tf = "\x00frame\xff"
+        self.decoder.dataReceived(bf + tf + bf)
+        self.assertEquals(self.decoder.handler.frames, ["frame"])
+
+
+    def test_binaryAndTextSplitted(self):
+        """
+        Intermingled binary and text frames can be split across several
+        C{dataReceived} calls.
+        """
+        tf1, tf2 = "\x00text\xff", "\x00other text\xff"
+        bf1, bf2, bf3 = ("\xff\x01X", "\xff\x81\x48" + "X" * 200,
+                         "\xff\x20" + "X" * 32)
+
+        chunks = [bf1[0], bf1[1:], tf1[:2], tf1[2:] + bf2[:2], bf2[2:-2],
+                  bf2[-2:-1], bf2[1] + tf2[:-1], tf2[-1], bf3]
+        for c in chunks:
+            self.decoder.dataReceived(c)
+
+        self.assertEquals(self.decoder.handler.frames, ["text", "other text"])
+        self.assertFalse(self.channel.transport.disconnected)
+
+
+    def text_maxBinaryLength(self):
+        """
+        If a binary frame's declared length exceeds MAX_BINARY_LENGTH, the
+        connection is dropped.
+        """
+        self.decoder.dataReceived("\xff\xff\xff\xff\xff\xff")
+        self.assertTrue(self.channel.transport.disconnected)
+
+
+    def test_closingHandshake(self):
+        """
+        After receiving the closing handshake, the server sends its own closing
+        handshake and ignores all future data.
+        """
+        self.decoder.dataReceived("\x00frame\xff\xff\x00random crap")
+        self.decoder.dataReceived("more random crap, that's discarded")
+        self.assertEquals(self.decoder.handler.frames, ["frame"])
+        self.assertTrue(self.decoder.closing)
+
+
+    def test_invalidFrameType(self):
+        """
+        Frame types other than 0x00 and 0xff cause the connection to be
+        dropped.
+        """
+        ok = "\x00ok\xff"
+        wrong = "\x05foo\xff"
+
+        self.decoder.dataReceived(ok + wrong + ok)
+        self.assertEquals(self.decoder.handler.frames, ["ok"])
+        error = self.assertOneDecodingError()
+        self.assertTrue(self.channel.transport.disconnected)
+
+
+    def test_emptyFrame(self):
+        """
+        An empty text frame is correctly parsed.
+        """
+        self.decoder.dataReceived("\x00\xff")
+        self.assertEquals(self.decoder.handler.frames, [""])
+        self.assertFalse(self.channel.transport.disconnected)
 
 
 class WebSocketHandlerTestCase(TestCase):
