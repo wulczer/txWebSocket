@@ -18,6 +18,8 @@ from hashlib import md5
 import struct
 
 from twisted.internet import interfaces
+from twisted.python import log
+from twisted.web._newclient import makeStatefulDispatcher
 from twisted.web.http import datetimeToString
 from twisted.web.http import _IdentityTransferDecoder
 from twisted.web.server import Request, Site, version, unquote
@@ -417,15 +419,28 @@ class WebSocketHandler(object):
         """
 
 
+class IncompleteFrame(Exception):
+    """
+    Not enough data to complete a WebSocket frame.
+    """
+
+
+class DecodingError(Exception):
+    """
+    The incoming data is not valid WebSocket protocol data.
+    """
+
 
 class WebSocketFrameDecoder(object):
     """
     Decode WebSocket frames and pass them to the attached C{WebSocketHandler}
     instance.
 
-    @ivar MAX_LENGTH: maximum len of the frame allowed, before calling
+    @ivar MAX_LENGTH: maximum len of a text frame allowed, before calling
         C{frameLengthExceeded} on the handler.
     @type MAX_LENGTH: C{int}
+    @ivar MAX_BINARY_LENGTH: like C{MAX_LENGTH}, but for 0xff type frames
+    @type MAX_BINARY_LENGTH: C{int}
     @ivar request: C{Request} instance.
     @type request: L{twisted.web.server.Request}
     @ivar handler: L{WebSocketHandler} instance handling the request.
@@ -438,13 +453,14 @@ class WebSocketFrameDecoder(object):
     """
 
     MAX_LENGTH = 16384
-
+    MAX_BINARY_LENGTH = 2147483648
 
     def __init__(self, request, handler):
         self.request = request
         self.handler = handler
         self._data = []
         self._currentFrameLength = 0
+        self._state = "FRAME_START"
 
     def dataReceived(self, data):
         """
@@ -455,35 +471,105 @@ class WebSocketFrameDecoder(object):
         """
         if not data:
             return
-        while True:
-            endIndex = data.find("\xff")
-            if endIndex != -1:
-                self._currentFrameLength += endIndex
-                if self._currentFrameLength > self.MAX_LENGTH:
-                    self.handler.frameLengthExceeded()
-                    break
-                self._currentFrameLength = 0
-                frame = "".join(self._data) + data[:endIndex]
-                self._data[:] = []
-                if frame[0] != "\x00":
-                    self.request.transport.loseConnection()
-                    break
-                self.handler.frameReceived(frame[1:])
-                data = data[endIndex + 1:]
-                if not data:
-                    break
-                if data[0] != "\x00":
-                    self.request.transport.loseConnection()
-                    break
-            else:
-                self._currentFrameLength += len(data)
-                if self._currentFrameLength > self.MAX_LENGTH + 1:
-                    self.handler.frameLengthExceeded()
-                else:
-                    self._data.append(data)
+        self._data.append(data)
+
+        while self._data:
+            try:
+                self.consumeData(self._data[-1])
+            except IncompleteFrame:
+                break
+            except DecodingError:
+                log.err()
+                self.request.transport.loseConnection()
                 break
 
+    def consumeData(self, data):
+        """
+        Process the last data chunk received.
+
+        After processing is done, L{IncompleteFrame} should be raised or
+        L{_addRemainingData} should be called.
+
+        @param data: last chunk of data received.
+        @type data: C{str}
+        """
+    consumeData = makeStatefulDispatcher("consumeData", consumeData)
+
+    def _consumeData_FRAME_START(self, data):
+        self._currentFrameLength = 0
+
+        if data[0] == "\x00":
+            self._state = "PARSING_TEXT_FRAME"
+        elif data[0] == "\xff":
+            self._state = "PARSING_LENGTH"
+        else:
+            raise DecodingError("Invalid frame type 0x%s" %
+                                data[0].encode("hex"))
+
+        self._addRemainingData(data[1:])
+
+    def _consumeData_PARSING_TEXT_FRAME(self, data):
+        endIndex = data.find("\xff")
+        if endIndex == -1:
+            self._currentFrameLength += len(data)
+        else:
+            self._currentFrameLength += endIndex
+
+        self._currentFrameLength += endIndex
+        # check length + 1 to account for the initial frame type byte
+        if self._currentFrameLength + 1 > self.MAX_LENGTH:
+            self.handler.frameLengthExceeded()
+
+        if endIndex == -1:
+            raise IncompleteFrame()
+
+        frame = "".join(self._data[:-1]) + data[:endIndex]
+        self.handler.frameReceived(frame)
+
+        remainingData = data[endIndex + 1:]
+        self._addRemainingData(remainingData)
+
+        self._state = "FRAME_START"
+
+    def _consumeData_PARSING_LENGTH(self, data):
+        current = 0
+        available = len(data)
+
+        while current < available:
+            byte = ord(data[current])
+            length, more = byte & 0x7F, bool(byte & 0x80)
+
+            self._currentFrameLength *= 128
+            self._currentFrameLength += length
+            if self._currentFrameLength > self.MAX_BINARY_LENGTH:
+                self.handler.frameLengthExceeded()
+
+            current += 1
+
+            if not more:
+                remainingData = data[current:]
+                self._addRemainingData(remainingData)
+                self._state = "PARSING_BINARY_FRAME"
+                break
+        else:
+            raise IncompleteFrame()
+
+    def _consumeData_PARSING_BINARY_FRAME(self, data):
+        available = len(data)
+
+        if self._currentFrameLength <= available:
+            remainingData = data[self._currentFrameLength:]
+            self._addRemainingData(remainingData)
+            self._state = "FRAME_START"
+        else:
+            self._currentFrameLength -= available
+            self._data[:] = []
+
+    def _addRemainingData(self, remainingData):
+        if remainingData:
+            self._data[:] = [remainingData]
+        else:
+            self._data[:] = []
 
 
 __all__ = ["WebSocketHandler", "WebSocketSite"]
-
