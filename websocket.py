@@ -441,6 +441,8 @@ class WebSocketFrameDecoder(object):
     @type MAX_LENGTH: C{int}
     @ivar MAX_BINARY_LENGTH: like C{MAX_LENGTH}, but for 0xff type frames
     @type MAX_BINARY_LENGTH: C{int}
+    @ivar closing: a flag set when the closing handshake has been received
+    @type closing: C{bool}
     @ivar request: C{Request} instance.
     @type request: L{twisted.web.server.Request}
     @ivar handler: L{WebSocketHandler} instance handling the request.
@@ -454,10 +456,12 @@ class WebSocketFrameDecoder(object):
 
     MAX_LENGTH = 16384
     MAX_BINARY_LENGTH = 2147483648
+    closing = False
 
     def __init__(self, request, handler):
         self.request = request
         self.handler = handler
+        self.closing = False
         self._data = []
         self._currentFrameLength = 0
         self._state = "FRAME_START"
@@ -469,11 +473,11 @@ class WebSocketFrameDecoder(object):
         @param data: data received over the WebSocket connection.
         @type data: C{str}
         """
-        if not data:
+        if not data or self.closing:
             return
         self._data.append(data)
 
-        while self._data:
+        while self._data and not self.closing:
             try:
                 self.consumeData(self._data[-1])
             except IncompleteFrame:
@@ -539,6 +543,10 @@ class WebSocketFrameDecoder(object):
             byte = ord(data[current])
             length, more = byte & 0x7F, bool(byte & 0x80)
 
+            if not length:
+                self._closingHandshake()
+                raise IncompleteFrame()
+
             self._currentFrameLength *= 128
             self._currentFrameLength += length
             if self._currentFrameLength > self.MAX_BINARY_LENGTH:
@@ -570,6 +578,13 @@ class WebSocketFrameDecoder(object):
             self._data[:] = [remainingData]
         else:
             self._data[:] = []
+
+    def _closingHandshake(self):
+        self.closing = True
+        # send the closing handshake
+        self.request.transport.write("\xff\x00")
+        # discard all buffered data
+        self._data[:] = []
 
 
 __all__ = ["WebSocketHandler", "WebSocketSite"]

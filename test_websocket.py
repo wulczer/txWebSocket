@@ -528,6 +528,17 @@ class WebSocketFrameDecoderTestCase(TestCase):
         self.assertTrue(self.channel.transport.disconnected)
 
 
+    def test_closingHandshake(self):
+        """
+        After receiving the closing handshake, the server sends its own closing
+        handshake and ignores all future data.
+        """
+        self.decoder.dataReceived("\x00frame\xff\xff\x00random crap")
+        self.decoder.dataReceived("more random crap, that's discarded")
+        self.assertEquals(self.decoder.handler.frames, ["frame"])
+        self.assertTrue(self.decoder.closing)
+
+
     def test_invalidFrameType(self):
         """
         Frame types other than 0x00 and 0xff cause the connection to be
