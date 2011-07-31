@@ -549,12 +549,13 @@ class WebSocketFrameDecoder(object):
 
             self._currentFrameLength *= 128
             self._currentFrameLength += length
-            if self._currentFrameLength > self.MAX_BINARY_LENGTH:
-                self.handler.frameLengthExceeded()
 
             current += 1
 
             if not more:
+                if self._currentFrameLength > self.MAX_BINARY_LENGTH:
+                    self.handler.frameLengthExceeded()
+
                 remainingData = data[current:]
                 self._addRemainingData(remainingData)
                 self._state = "PARSING_BINARY_FRAME"
