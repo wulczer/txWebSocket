@@ -39,6 +39,10 @@ ALL_OPCODES = (OPCODE_CONT, OPCODE_TEXT, OPCODE_BINARY,
                OPCODE_CLOSE, OPCODE_PING, OPCODE_PONG)
 
 
+CONTROL_OPCODES = (OPCODE_CLOSE, OPCODE_PING, OPCODE_PONG)
+DATA_OPCODES = (OPCODE_TEXT, OPCODE_BINARY)
+
+
 class WebSocketRequest(Request):
     """
     A general purpose L{Request} supporting connection upgrade for WebSocket.
@@ -333,7 +337,8 @@ class WebSocketRequest(Request):
 
             self.write("\r\n")
             self.channel.setRawMode()
-            self.channel._transferDecoder = WebSocketHybiFrameDecoder(
+            # XXX we probably don't want to set _transferDecoder
+            self.channel._transferDecoder = WebSocketFrameDecoder(
                 self, handler)
             handler.transport._connectionMade()
             return
@@ -469,15 +474,23 @@ class WebSocketHybiTransport(WebSocketTransport):
         for frame in frames:
             self.sendFrame(OPCODE_TEXT, frame)
 
-    def sendFrame(self, opcode, payload):
+    def sendFrame(self, opcode, payload, fragmented=False):
         """
-        Send a frame with the given opcode and payload to the client. The frame
-        will never be sent fragmented.
+        Send a frame with the given opcode and payload to the client. If the
+        L{fragmented} parameter is set, the message frame will contain a flag
+        saying it's part of a fragmented payload, by default data is sent as a
+        self-contained frame. Note that if you use fragmentation support, it is
+        up to you to correctly set the first frame's opcode and then use
+        L{OPCODE_CONT} on the following continuation frames.
+
+        Payloads sent using this method are never masked.
 
         @param opcode: the opcode as defined in hybi-10
         @type opcode: C{int}
         @param payload: the frame's payload
         @type payload: C{str}
+        @param fragmented: should the frame be marked as part of a fragmented payload
+        @type fragmented: C{bool}
         """
         if opcode not in ALL_OPCODES:
             raise ValueError("Invalid opcode 0x%X" % opcode)
@@ -486,7 +499,11 @@ class WebSocketHybiTransport(WebSocketTransport):
 
         # there's always the header and at least one length field
         spec = ">BB"
-        data = [0x80 | opcode]
+        if fragmented:
+            header = 0x00
+        else:
+            header = 0x80
+        data = [header | opcode]
 
         # there's no masking, so the high bit of the first byte of length is
         # always 0
@@ -710,12 +727,13 @@ class WebSocketFrameDecoder(object):
 
             self._currentFrameLength *= 128
             self._currentFrameLength += length
-            if self._currentFrameLength > self.MAX_BINARY_LENGTH:
-                self.handler.frameLengthExceeded()
 
             current += 1
 
             if not more:
+                if self._currentFrameLength > self.MAX_BINARY_LENGTH:
+                    self.handler.frameLengthExceeded()
+
                 remainingData = data[current:]
                 self._addRemainingData(remainingData)
                 self._state = "PARSING_BINARY_FRAME"
@@ -753,25 +771,53 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
     def __init__(self, request, handler):
         WebSocketFrameDecoder.__init__(self, request, handler)
         self._opcode = None
+        self._fragment_opcode = None
+        self._fragments = []
         self._state = "HYBI_FRAME_START"
 
     def _consumeData_HYBI_FRAME_START(self, data):
+        self._opcode = None
+
         byte = ord(data[0])
         fin, reserved, opcode = byte & 0x80, byte & 0x70, byte & 0x0F
-
-        if not fin:
-            raise DecodingError("Fragmentation not supported yet")
 
         if reserved:
             raise DecodingError("Reserved bits set: 0x%02X" % byte)
 
-        if opcode == OPCODE_CONT:
-            raise DecodingError("Fragmentation not supported yet")
-
         if opcode not in ALL_OPCODES:
             raise DecodingError("Invalid opcode 0x%X" % opcode)
 
-        self._opcode = opcode
+        if not fin:
+            # part of a fragmented frame
+            if not self._fragment_opcode:
+                # first of the fragmented frames, which determines the opcode
+                if opcode not in DATA_OPCODES:
+                    raise DecodingError(
+                        "Fragmented frame with invalid opcode 0x%X" % opcode)
+                # save the opcode for later use
+                self._fragment_opcode = opcode
+            else:
+                # already reading a fragmet, and this is a fragmented frame, so
+                # it has to use the continuation opcode
+                if opcode != OPCODE_CONT:
+                    raise DecodingError(
+                        "Continuation frame with invalid opcode 0x%X" % opcode)
+        else:
+            # self-contained frame or last of the fragmented frames
+            if self._fragment_opcode:
+                # a fragmented frame is pending, so this can only be the end of
+                # it or a control message
+                if opcode not in CONTROL_OPCODES and opcode != OPCODE_CONT:
+                    raise DecodingError(
+                        "Final frame with invalid opcode 0x%X" % opcode)
+            else:
+                # no fragmented frames pending, so this cannot be a
+                # continuation frame
+                if opcode == OPCODE_CONT:
+                    raise DecodingError(
+                        "Final frame with invalid opcode 0x%X" % opcode)
+            self._opcode = opcode
+
         self._state = "HYBI_PARSING_LENGTH"
         self._addRemainingData(data[1:])
 
@@ -811,13 +857,6 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
                 "Frame length exceeded: %r" % self._currentFrameLength)
         self._addRemainingData(data[needed:])
 
-        if self._opcode == OPCODE_TEXT:
-            if self._currentFrameLength > self.MAX_LENGTH:
-                self.handler.frameLengthExceeded()
-        elif self._opcode == OPCODE_BINARY:
-            if self._currentFrameLength > self.MAX_BINARY_LENGTH:
-                self.handler.frameLengthExceeded()
-
         self._state = "HYBI_MASKING_KEY"
 
     def _consumeData_HYBI_MASKING_KEY(self, data):
@@ -827,7 +866,13 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         data = "".join(self._data)
         self._maskingKey = struct.unpack(">4B", data[:4])
         self._addRemainingData(data[4:])
-        self._state = "HYBI_PAYLOAD"
+
+        if self._currentFrameLength:
+            self._state = "HYBI_PAYLOAD"
+        else:
+            # there will be no payload, notify the handler of an empty frame
+            # and continue
+            self._frameCompleted("", data[4:])
 
     def _consumeData_HYBI_PAYLOAD(self, data):
         available = len(data)
@@ -850,19 +895,40 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         unmasked = itertools.imap(xor, allData, key)
 
         frame = "".join(unmasked)
+        remainingData = data[self._currentFrameLength:]
+
+        self._frameCompleted(frame, remainingData)
+
+    def _frameCompleted(self, frame, remainingData):
+        # if it's part of a fragmented frame, store the payload
+        if self._opcode is None:
+            self._fragments.append(frame)
+
+        # if it's the last of the fragmented frames, replace the opcode with
+        # the original one from the fragment and the frame with the accumulated
+        # payload
+        if self._opcode == OPCODE_CONT:
+            self._opcode = self._fragment_opcode
+            self._fragments.append(frame)
+            frame = "".join(self._fragments)
+            self._fragment_opcode = None
+            self._fragments[:] = []
 
         if self._opcode == OPCODE_TEXT:
             # assume it's valid UTF-8 and let the client handle the rest
+            if len(frame) > self.MAX_LENGTH:
+                self.handler.frameLengthExceeded()
             self.handler.frameReceived(frame)
         elif self._opcode == OPCODE_BINARY:
+            if len(frame) > self.MAX_BINARY_LENGTH:
+                self.handler.frameLengthExceeded()
             self.handler.binaryFrameReceived(frame)
         elif self._opcode == OPCODE_PING:
-            self.transport.sendFrame(OPCODE_PONG, frame)
+            self.handler.transport.sendFrame(OPCODE_PONG, frame)
         elif self._opcode == OPCODE_PONG:
             self.handler.pongReceived(frame)
 
         self._state = "HYBI_FRAME_START"
-        remainingData = data[self._currentFrameLength:]
         self._addRemainingData(remainingData)
 
         # if the opcode was CLOSE, initiate connection closing
@@ -882,11 +948,11 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         self.handler.closeReceived(code, msg)
 
         # send the closing handshake
-        self.transport.sendFrame(OPCODE_CLOSE, "")
+        self.handler.transport.sendFrame(OPCODE_CLOSE, "")
 
         # discard all buffered data and lose connection
         self._data[:] = []
-        self.transport.loseConnection()
+        self.handler.transport.loseConnection()
 
 
 __all__ = ["WebSocketHandler", "WebSocketSite"]
