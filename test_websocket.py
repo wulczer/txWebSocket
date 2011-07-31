@@ -803,6 +803,8 @@ class WebSocketHybiFrameDecoderTestCase(TestCase):
         """
         self.decoder.dataReceived(self.hello + self.close + "crap" * 20)
         self.assertEquals(self.decoder.handler.frames, ["Hello"])
+        self.assertEquals(self.decoder.handler.closes,
+                          [(1000, "Normal Closure")])
 
         result = self.channel.transport.written.getvalue()
         headers, response = result.split('\r\n\r\n')
