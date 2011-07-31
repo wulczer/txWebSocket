@@ -476,15 +476,23 @@ class WebSocketHybiTransport(WebSocketTransport):
         for frame in frames:
             self.sendFrame(OPCODE_TEXT, frame)
 
-    def sendFrame(self, opcode, payload):
+    def sendFrame(self, opcode, payload, fragmented=False):
         """
-        Send a frame with the given opcode and payload to the client. The frame
-        will never be sent fragmented.
+        Send a frame with the given opcode and payload to the client. If the
+        L{fragmented} parameter is set, the message frame will contain a flag
+        saying it's part of a fragmented payload, by default data is sent as a
+        self-contained frame. Note that if you use fragmentation support, it is
+        up to you to correctly set the first frame's opcode and then use
+        L{OPCODE_CONT} on the following continuation frames.
+
+        Payloads sent using this method are never masked.
 
         @param opcode: the opcode as defined in hybi-10
         @type opcode: C{int}
         @param payload: the frame's payload
         @type payload: C{str}
+        @param fragmented: should the frame be marked as part of a fragmented payload
+        @type fragmented: C{bool}
         """
         if opcode not in ALL_OPCODES:
             raise ValueError("Invalid opcode 0x%X" % opcode)
@@ -493,7 +501,11 @@ class WebSocketHybiTransport(WebSocketTransport):
 
         # there's always the header and at least one length field
         spec = ">BB"
-        data = [0x80 | opcode]
+        if fragmented:
+            header = 0x00
+        else:
+            header = 0x80
+        data = [header | opcode]
 
         # there's no masking, so the high bit of the first byte of length is
         # always 0
