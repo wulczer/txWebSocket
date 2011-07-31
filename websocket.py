@@ -869,7 +869,13 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         data = "".join(self._data)
         self._maskingKey = struct.unpack(">4B", data[:4])
         self._addRemainingData(data[4:])
-        self._state = "HYBI_PAYLOAD"
+
+        if self._currentFrameLength:
+            self._state = "HYBI_PAYLOAD"
+        else:
+            # there will be no payload, notify the handler of an empty frame
+            # and continue
+            self._frameCompleted("", data[4:])
 
     def _consumeData_HYBI_PAYLOAD(self, data):
         available = len(data)
