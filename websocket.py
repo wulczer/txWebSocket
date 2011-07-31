@@ -921,7 +921,7 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
                 self.handler.frameLengthExceeded()
             self.handler.binaryFrameReceived(frame)
         elif self._opcode == OPCODE_PING:
-            self.transport.sendFrame(OPCODE_PONG, frame)
+            self.handler.transport.sendFrame(OPCODE_PONG, frame)
         elif self._opcode == OPCODE_PONG:
             self.handler.pongReceived(frame)
 
@@ -945,11 +945,11 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         self.handler.closeReceived(code, msg)
 
         # send the closing handshake
-        self.transport.sendFrame(OPCODE_CLOSE, "")
+        self.handler.transport.sendFrame(OPCODE_CLOSE, "")
 
         # discard all buffered data and lose connection
         self._data[:] = []
-        self.transport.loseConnection()
+        self.handler.transport.loseConnection()
 
 
 __all__ = ["WebSocketHandler", "WebSocketSite"]
