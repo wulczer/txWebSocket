@@ -14,7 +14,9 @@ current version of the specification.
 @since: 10.1
 """
 
-from hashlib import md5
+import base64
+from hashlib import md5, sha1
+import itertools
 import struct
 
 from twisted.internet import interfaces
@@ -28,17 +30,33 @@ from zope.interface import implements
 
 _ascii_numbers = frozenset(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'])
 
+
+(OPCODE_CONT, OPCODE_TEXT, OPCODE_BINARY,
+ OPCODE_CLOSE, OPCODE_PING, OPCODE_PONG) = (0x0, 0x1, 0x2, 0x8, 0x9, 0xA)
+
+
+ALL_OPCODES = (OPCODE_CONT, OPCODE_TEXT, OPCODE_BINARY,
+               OPCODE_CLOSE, OPCODE_PING, OPCODE_PONG)
+
+
 class WebSocketRequest(Request):
     """
     A general purpose L{Request} supporting connection upgrade for WebSocket.
     """
 
+    ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
     def process(self):
-        if (self.requestHeaders.getRawHeaders("Upgrade") == ["WebSocket"] and
-            self.requestHeaders.getRawHeaders("Connection") == ["Upgrade"]):
-            return self.processWebSocket()
-        else:
+        connection = self.requestHeaders.getRawHeaders("Connection", [None])[0]
+        upgrade = self.requestHeaders.getRawHeaders("Upgrade", [None])[0]
+
+        if connection != "Upgrade":
             return Request.process(self)
+
+        if upgrade not in ("WebSocket", "websocket"):
+            return Request.process(self)
+
+        return self.processWebSocket()
 
     def processWebSocket(self):
         """
@@ -217,6 +235,60 @@ class WebSocketRequest(Request):
             protocolHeader = None
         return originHeaders[0], hostHeaders[0], protocolHeader, handler
 
+    def _getOneHeader(self, name):
+        headers = self.requestHeaders.getRawHeaders(name)
+        if not headers or len(headers) > 1:
+            return None
+        return headers[0]
+
+    def _clientHandshakeHybi(self):
+        """
+        Initial handshake, as defined in hybi-10.
+
+        If the client is not following the hybi-10 protocol or is requesting a
+        version that's lower than what hybi-10 describes, the connection will
+        be closed.
+
+        Otherwise the appropriate transport and content decoders will be
+        plugged in and the connection will be estabilished.
+        """
+        version = self._getOneHeader("Sec-WebSocket-Version")
+        # we only speak version 8 of the protocol
+        if version != "8":
+            self.setResponseCode(426, "Upgrade Required")
+            self.setHeader("Sec-WebSocket-Version", "8")
+            return self.finish()
+
+        key = self._getOneHeader("Sec-WebSocket-Key")
+        if not key:
+            self.setResponseCode(400, "Bad Request")
+            return self.finish()
+
+        handlerFactory = self.site.handlers.get(self.uri)
+        if not handlerFactory:
+            self.setResponseCode(404, "Not Found")
+            return self.finish()
+
+        transport = WebSocketHybiTransport(self)
+        handler = handlerFactory(transport)
+        transport._attachHandler(handler)
+
+        accept = base64.b64encode(sha1(key + self.ACCEPT_GUID).digest())
+        self.startedWriting = True
+        handshake = [
+            "HTTP/1.1 101 Switching Protocols",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            "Sec-WebSocket-Accept: %s" % accept]
+
+        for header in handshake:
+            self.write("%s\r\n" % header)
+
+        self.write("\r\n")
+        self.channel.setRawMode()
+        self.channel._transferDecoder = WebSocketHybiFrameDecoder(
+            self, handler)
+        handler.transport._connectionMade()
 
     def renderWebSocket(self):
         """
@@ -226,6 +298,10 @@ class WebSocketRequest(Request):
         connection will be closed. Otherwise, the response to the handshake is
         sent and a C{WebSocketHandler} is created to handle the request.
         """
+        # check for hybi handshake requests
+        if self.requestHeaders.hasHeader("Sec-WebSocket-Version"):
+            return self._clientHandshakeHybi()
+
         # check for post-75 handshake requests
         isSecHandshake = self.requestHeaders.getRawHeaders("Sec-WebSocket-Key1", [])
         if isSecHandshake:
@@ -257,8 +333,7 @@ class WebSocketRequest(Request):
 
             self.write("\r\n")
             self.channel.setRawMode()
-            # XXX we probably don't want to set _transferDecoder
-            self.channel._transferDecoder = WebSocketFrameDecoder(
+            self.channel._transferDecoder = WebSocketHybiFrameDecoder(
                 self, handler)
             handler.transport._connectionMade()
             return
@@ -373,6 +448,66 @@ class WebSocketTransport(object):
         del self._request
         del self._handler
 
+
+class WebSocketHybiTransport(WebSocketTransport):
+    """
+    A WebSocket transport that speaks the hybi-10 protocol. The L{ITransport}
+    methods are set up to send Text frames containing the payload. To have
+    finer-grained control over the type of frame being sent, the transport
+    provides a L{sendFrame} method.
+    """
+    def write(self, frame):
+        """
+        Treat the given frame as a text frame and send it to the client.
+
+        @param frame: a I{UTF-8} encoded C{str} to send to the client.
+        @type frame: C{str}
+        """
+        self.sendFrame(OPCODE_TEXT, frame)
+
+    def writeSequence(self, frames):
+        """
+        Send a sequence of text frames to the connected client.
+        """
+        for frame in frames:
+            self.sendFrame(OPCODE_TEXT, frame)
+
+    def sendFrame(self, opcode, payload):
+        """
+        Send a frame with the given opcode and payload to the client. The frame
+        will never be sent fragmented.
+
+        @param opcode: the opcode as defined in hybi-10
+        @type opcode: C{int}
+        @param payload: the frame's payload
+        @type payload: C{str}
+        """
+        if opcode not in ALL_OPCODES:
+            raise ValueError("Invalid opcode 0x%X" % opcode)
+
+        length = len(payload)
+
+        # there's always the header and at least one length field
+        spec = ">BB"
+        data = [0x80 | opcode]
+
+        # there's no masking, so the high bit of the first byte of length is
+        # always 0
+        if 125 < length <= 65535:
+            # add a 16-bit int to the spec and append 126 value, which means
+            # "interpret the next two bytes"
+            spec += "H"
+            data.append(126)
+        elif length > 65535:
+            # same for even longer frames
+            spec += "Q"
+            data.append(127)
+
+        data.append(length)
+        header = struct.pack(spec, *data)
+        self._request.write(header + payload)
+
+
 class WebSocketHandler(object):
     """
     Base class for handling WebSocket connections. It mainly provides a
@@ -396,6 +531,35 @@ class WebSocketHandler(object):
 
         @param frame: a I{UTF-8} encoded C{str} sent by the client.
         @type frame: C{str}
+        """
+
+
+    def binaryFrameReceived(self, data):
+        """
+        Called when a binary is received via the hybi protocol.
+
+        @param data: a binary C{str} sent by the client.
+        @type data: C{str}
+        """
+
+
+    def pongReceived(self, data):
+        """
+        Called when a pong control message is received via the hybi protocol.
+
+        @param data: the payload sent by the client.
+        @type data: C{str}
+        """
+
+
+    def closeReceived(self, code, msg):
+        """
+        Called when a close control message is received via the hybi protocol.
+
+        @param code: the status code of the close message, if present
+        @type code: C{int} or C{None}
+        @param msg: the I{UTF-8} encoded message sent by the client, if present
+        @type msg: C{str} or C{None}
         """
 
 
@@ -585,6 +749,147 @@ class WebSocketFrameDecoder(object):
         self.request.transport.write("\xff\x00")
         # discard all buffered data
         self._data[:] = []
+
+
+class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
+
+    def __init__(self, request, handler):
+        WebSocketFrameDecoder.__init__(self, request, handler)
+        self._opcode = None
+        self._state = "HYBI_FRAME_START"
+
+    def _consumeData_HYBI_FRAME_START(self, data):
+        byte = ord(data[0])
+        fin, reserved, opcode = byte & 0x80, byte & 0x70, byte & 0x0F
+
+        if not fin:
+            raise DecodingError("Fragmentation not supported yet")
+
+        if reserved:
+            raise DecodingError("Reserved bits set: 0x%02X" % byte)
+
+        if opcode == OPCODE_CONT:
+            raise DecodingError("Fragmentation not supported yet")
+
+        if opcode not in ALL_OPCODES:
+            raise DecodingError("Invalid opcode 0x%X" % opcode)
+
+        self._opcode = opcode
+        self._state = "HYBI_PARSING_LENGTH"
+        self._addRemainingData(data[1:])
+
+    def _consumeData_HYBI_PARSING_LENGTH(self, data):
+        byte = ord(data[0])
+        masked, length = byte & 0x80, byte & 0x7F
+
+        if not masked:
+            raise DecodingError("Unmasked frame received")
+
+        if length < 126:
+            self._currentFrameLength = length
+            self._state = "HYBI_MASKING_KEY"
+        elif length == 126:
+            self._state = "HYBI_PARSING_LENGTH_2"
+        elif length == 127:
+            self._state = "HYBI_PARSING_LENGTH_3"
+
+        self._addRemainingData(data[1:])
+
+    def _consumeData_HYBI_PARSING_LENGTH_2(self, data):
+        self._parse_length_spec(2, ">H")
+
+    def _consumeData_HYBI_PARSING_LENGTH_3(self, data):
+        self._parse_length_spec(8, ">Q", 0x7fffffffffffffff)
+
+    def _parse_length_spec(self, needed, spec, limit=None):
+        # if the accumulated data is not long enough to parse out the length,
+        # keep on accumulating
+        if sum(map(len, self._data)) < needed:
+            raise IncompleteFrame()
+
+        data = "".join(self._data)
+        self._currentFrameLength = struct.unpack(spec, data[:needed])[0]
+        if limit and self._currentFrameLength > limit:
+            raise DecodingError(
+                "Frame length exceeded: %r" % self._currentFrameLength)
+        self._addRemainingData(data[needed:])
+
+        if self._opcode == OPCODE_TEXT:
+            if self._currentFrameLength > self.MAX_LENGTH:
+                self.handler.frameLengthExceeded()
+        elif self._opcode == OPCODE_BINARY:
+            if self._currentFrameLength > self.MAX_BINARY_LENGTH:
+                self.handler.frameLengthExceeded()
+
+        self._state = "HYBI_MASKING_KEY"
+
+    def _consumeData_HYBI_MASKING_KEY(self, data):
+        if sum(map(len, self._data)) < 4:
+            raise IncompleteFrame()
+
+        data = "".join(self._data)
+        self._maskingKey = struct.unpack(">4B", data[:4])
+        self._addRemainingData(data[4:])
+        self._state = "HYBI_PAYLOAD"
+
+    def _consumeData_HYBI_PAYLOAD(self, data):
+        available = len(data)
+
+        if self._currentFrameLength > available:
+            self._currentFrameLength -= available
+            raise IncompleteFrame()
+
+        frame = "".join(self._data[:-1]) + data[:self._currentFrameLength]
+
+        # unmask the frame
+        bufferedPayload = itertools.chain(*self._data[:-1])
+        restOfPayload = data[:self._currentFrameLength]
+        allData = itertools.chain(bufferedPayload, restOfPayload)
+
+        key = itertools.cycle(self._maskingKey)
+
+        def xor(c, k):
+            return chr(ord(c) ^ k)
+        unmasked = itertools.imap(xor, allData, key)
+
+        frame = "".join(unmasked)
+
+        if self._opcode == OPCODE_TEXT:
+            # assume it's valid UTF-8 and let the client handle the rest
+            self.handler.frameReceived(frame)
+        elif self._opcode == OPCODE_BINARY:
+            self.handler.binaryFrameReceived(frame)
+        elif self._opcode == OPCODE_PING:
+            self.transport.sendFrame(OPCODE_PONG, frame)
+        elif self._opcode == OPCODE_PONG:
+            self.handler.pongReceived(frame)
+
+        self._state = "HYBI_FRAME_START"
+        remainingData = data[self._currentFrameLength:]
+        self._addRemainingData(remainingData)
+
+        # if the opcode was CLOSE, initiate connection closing
+        if self._opcode == OPCODE_CLOSE:
+            self._hybiClose(frame)
+
+    def _hybiClose(self, frame):
+        self.closing = True
+
+        # try to parse out the status code and message
+        if len(frame) > 1:
+            code = struct.unpack(">H", frame[:2])[0]
+            msg = frame[2:]
+        else:
+            code, msg = None, None
+        # let the handler know
+        self.handler.closeReceived(code, msg)
+
+        # send the closing handshake
+        self.transport.sendFrame(OPCODE_CLOSE, "")
+
+        # discard all buffered data and lose connection
+        self._data[:] = []
+        self.transport.loseConnection()
 
 
 __all__ = ["WebSocketHandler", "WebSocketSite"]
