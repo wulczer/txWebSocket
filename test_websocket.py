@@ -519,12 +519,12 @@ class WebSocketFrameDecoderTestCase(TestCase):
         self.assertFalse(self.channel.transport.disconnected)
 
 
-    def text_maxBinaryLength(self):
+    def test_maxBinaryLength(self):
         """
         If a binary frame's declared length exceeds MAX_BINARY_LENGTH, the
         connection is dropped.
         """
-        self.decoder.dataReceived("\xff\xff\xff\xff\xff\xff")
+        self.decoder.dataReceived("\xff\xff\xff\xff\xff\x01")
         self.assertTrue(self.channel.transport.disconnected)
 
 
