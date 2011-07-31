@@ -892,9 +892,13 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         unmasked = itertools.imap(xor, allData, key)
 
         frame = "".join(unmasked)
+        remainingData = data[self._currentFrameLength:]
 
+        self._frameCompleted(frame, remainingData)
+
+    def _frameCompleted(self, frame, remainingData):
         # if it's part of a fragmented frame, store the payload
-        if self._fragment_opcode:
+        if self._opcode is None:
             self._fragments.append(frame)
 
         # if it's the last of the fragmented frames, replace the opcode with
@@ -902,6 +906,7 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
         # payload
         if self._opcode == OPCODE_CONT:
             self._opcode = self._fragment_opcode
+            self._fragments.append(frame)
             frame = "".join(self._fragments)
             self._fragment_opcode = None
             self._fragments[:] = []
@@ -921,7 +926,6 @@ class WebSocketHybiFrameDecoder(WebSocketFrameDecoder):
             self.handler.pongReceived(frame)
 
         self._state = "HYBI_FRAME_START"
-        remainingData = data[self._currentFrameLength:]
         self._addRemainingData(remainingData)
 
         # if the opcode was CLOSE, initiate connection closing
