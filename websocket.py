@@ -337,7 +337,8 @@ class WebSocketRequest(Request):
 
             self.write("\r\n")
             self.channel.setRawMode()
-            self.channel._transferDecoder = WebSocketHybiFrameDecoder(
+            # XXX we probably don't want to set _transferDecoder
+            self.channel._transferDecoder = WebSocketFrameDecoder(
                 self, handler)
             handler.transport._connectionMade()
             return
