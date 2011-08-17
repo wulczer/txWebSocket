@@ -54,7 +54,7 @@ class WebSocketRequest(Request):
         connection = self.requestHeaders.getRawHeaders("Connection", [None])[0]
         upgrade = self.requestHeaders.getRawHeaders("Upgrade", [None])[0]
 
-        if connection != "Upgrade":
+        if not connection or "Upgrade" not in connection:
             return Request.process(self)
 
         if upgrade not in ("WebSocket", "websocket"):
