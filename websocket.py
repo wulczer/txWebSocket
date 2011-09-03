@@ -388,6 +388,7 @@ class WebSocketTransport(object):
 
     def __init__(self, request):
         self._request = request
+        self._connected = 1
         self._request.notifyFinish().addErrback(self._connectionLost)
 
     def _attachHandler(self, handler):
@@ -406,6 +407,7 @@ class WebSocketTransport(object):
         """
         Forward connection lost event to the L{WebSocketHandler}.
         """
+        self._connected = 0
         self._handler.connectionLost(reason)
         del self._request.transport
         del self._request
@@ -426,7 +428,6 @@ class WebSocketTransport(object):
 
         @return: An L{IAddress} provider.
         """
-
         return self._request.transport.getHost()
 
     def write(self, frame):
@@ -436,19 +437,22 @@ class WebSocketTransport(object):
         @param frame: a I{UTF-8} encoded C{str} to send to the client.
         @type frame: C{str}
         """
-        self._request.write("\x00%s\xff" % frame)
+        if self._connected:
+            self._request.write("\x00%s\xff" % frame)
 
     def writeSequence(self, frames):
         """
         Send a sequence of frames to the connected client.
         """
-        self._request.write("".join(["\x00%s\xff" % f for f in frames]))
+        if self._connected:
+            self._request.write("".join(["\x00%s\xff" % f for f in frames]))
 
     def loseConnection(self):
         """
         Close the connection.
         """
-        self._request.transport.loseConnection()
+        if self._connected:
+            self._request.transport.loseConnection()
 
 
 class WebSocketHybiTransport(WebSocketTransport):
