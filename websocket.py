@@ -247,9 +247,9 @@ class WebSocketRequest(Request):
 
     def _clientHandshakeHybi(self):
         """
-        Initial handshake, as defined in hybi-10.
+        Initial handshake, as defined in hybi-10 and 16 (versions 8 and 13).
 
-        If the client is not following the hybi-10 protocol or is requesting a
+        If the client is not following the hybi-10 or 16 protocol or is requesting a
         version that's lower than what hybi-10 describes, the connection will
         be closed.
 
@@ -257,8 +257,8 @@ class WebSocketRequest(Request):
         plugged in and the connection will be estabilished.
         """
         version = self._getOneHeader("Sec-WebSocket-Version")
-        # we only speak version 8 of the protocol
-        if version != "8":
+        # we only speak version 8 and 13 of the protocol
+        if version not in ("8", "13"):
             self.setResponseCode(426, "Upgrade Required")
             self.setHeader("Sec-WebSocket-Version", "8")
             return self.finish()
