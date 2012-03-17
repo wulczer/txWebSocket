@@ -5,7 +5,12 @@
         <script language='javascript'>
 
             $(document).ready(function() {
-                var ws = new WebSocket("ws://localhost:8080/test");
+                var ws;
+                if (typeof MozWebSocket != "undefined") {
+                    ws = new MozWebSocket("ws://localhost:8080/test");
+                } else {
+                    ws = new WebSocket("ws://localhost:8080/test");
+                }
                 ws.onmessage = function(evt) {
                     $('#output').text(evt.data);
                 }
