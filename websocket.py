@@ -523,7 +523,8 @@ class WebSocketHybiTransport(WebSocketTransport):
 
         data.append(length)
         header = struct.pack(spec, *data)
-        self._request.write(header + payload)
+        if self._connected:
+            self._request.write(header + payload)
 
 
 class WebSocketHandler(object):
