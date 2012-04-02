@@ -257,10 +257,10 @@ class WebSocketRequest(Request):
         plugged in and the connection will be estabilished.
         """
         version = self._getOneHeader("Sec-WebSocket-Version")
-        # we only speak version 8 and 13 of the protocol
-        if version not in ("8", "13"):
+        # we only speak version 7, 8 and 13 of the protocol
+        if version not in ("7", "8", "13"):
             self.setResponseCode(426, "Upgrade Required")
-            self.setHeader("Sec-WebSocket-Version", "8")
+            self.setHeader("Sec-WebSocket-Version", "7")
             return self.finish()
 
         key = self._getOneHeader("Sec-WebSocket-Key")
