@@ -454,6 +454,13 @@ class WebSocketTransport(object):
         if self._connected:
             self._request.transport.loseConnection()
 
+    def abortConnection(self):
+        """
+        Forcibly close the connection.
+        """
+        if self._connected:
+            self._request.transport.abortConnection()
+
 
 class WebSocketHybiTransport(WebSocketTransport):
     """
